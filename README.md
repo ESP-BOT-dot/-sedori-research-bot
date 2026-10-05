@@ -1,2 +1,0 @@
-# -sedori-research-bot
-    Public
