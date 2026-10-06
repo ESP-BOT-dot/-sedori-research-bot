@@ -1,35 +1,81 @@
-from fastapi import FastAPI
+from __future__ import annotations
+import asyncio, os
+from typing import Any
+import httpx
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="せどりリサーチBot")
+app = FastAPI(title='せどりリサーチBot', version='2.0.0')
+RAKUTEN_APP_ID=os.getenv('RAKUTEN_APP_ID','')
+RAKUTEN_ACCESS_KEY=os.getenv('RAKUTEN_ACCESS_KEY','')
+YAHOO_APP_ID=os.getenv('YAHOO_APP_ID','')
 
-DEMO = [
-    {"name":"ワイヤレスイヤホン Pro", "buy":3980, "sell":7980, "source":"Demo", "url":"https://www.amazon.co.jp/"},
-    {"name":"人気ゲームソフト", "buy":4500, "sell":8200, "source":"Demo", "url":"https://www.rakuten.co.jp/"},
-    {"name":"フィギュア 限定版", "buy":5200, "sell":9800, "source":"Demo", "url":"https://shopping.yahoo.co.jp/"},
+DEMO=[
+ {'name':'Nintendo Switch 本体','purchase_price':29800,'sale_price':34980,'source':'デモデータ'},
+ {'name':'ワイヤレスイヤホン','purchase_price':4980,'sale_price':7980,'source':'デモデータ'},
+ {'name':'フィギュア','purchase_price':6800,'sale_price':10800,'source':'デモデータ'},
 ]
 
-def calc(x):
-    sell=x["sell"]; buy=x["buy"]
-    fee=round(sell*0.10); shipping=750
-    profit=sell-buy-fee-shipping
-    margin=round(profit/sell*100,1) if sell else 0
-    return {**x,"fee":fee,"shipping":shipping,"profit":profit,"margin":margin}
+def calc(purchase,sale,fee_rate,shipping):
+ fee=sale*fee_rate/100
+ profit=sale-purchase-fee-shipping
+ margin=profit/purchase*100 if purchase else 0
+ return {'fee':round(fee),'profit':round(profit),'margin':round(margin,1)}
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return HTML
+async def rakuten(keyword,hits=30):
+ if not (RAKUTEN_APP_ID and RAKUTEN_ACCESS_KEY): return []
+ url='https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701'
+ params={'applicationId':RAKUTEN_APP_ID,'accessKey':RAKUTEN_ACCESS_KEY,'format':'json','keyword':keyword,'hits':min(hits,30),'sort':'+itemPrice','availability':1,'imageFlag':1}
+ async with httpx.AsyncClient(timeout=10) as c:
+  r=await c.get(url,params=params); r.raise_for_status(); data=r.json()
+ out=[]
+ for x in data.get('Items',[]):
+  i=x.get('Item',x); imgs=i.get('mediumImageUrls') or []
+  out.append({'name':i.get('itemName',''),'price':float(i.get('itemPrice') or 0),'url':i.get('itemUrl',''),'image':imgs[0].get('imageUrl','') if imgs else '','source':'楽天市場'})
+ return out
 
-@app.get("/api/search")
-def search(keyword:str="", min_profit:int=0, min_margin:float=0):
-    items=[calc(x) for x in DEMO if not keyword or keyword.lower() in x["name"].lower()]
-    items=[x for x in items if x["profit"]>=min_profit and x["margin"]>=min_margin]
-    items.sort(key=lambda x:x["profit"], reverse=True)
-    return {"items":items}
+async def yahoo(keyword,hits=30):
+ if not YAHOO_APP_ID: return []
+ url='https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch'
+ params={'appid':YAHOO_APP_ID,'query':keyword,'results':min(hits,50),'sort':'-price','condition':'new','image_size':300}
+ async with httpx.AsyncClient(timeout=10) as c:
+  r=await c.get(url,params=params); r.raise_for_status(); data=r.json()
+ out=[]
+ for x in data.get('hits',[]):
+  img=x.get('image') or {}
+  out.append({'name':x.get('name',''),'price':float(x.get('price') or 0),'url':x.get('url',''),'image':img.get('medium',''),'source':'Yahoo!ショッピング'})
+ return out
 
-@app.get("/health")
-def health():
-    return {"status":"ok"}
+def candidates(buys,sells,min_profit,min_margin,fee_rate,shipping):
+ prices=sorted(x['price'] for x in sells if x['price']>0)
+ if not prices:return []
+ ref=prices[min(len(prices)-1,max(0,int(len(prices)*.75)))]
+ sale=min(sells,key=lambda x:abs(x['price']-ref))
+ out=[]
+ for b in buys:
+  if b['price']<=0:continue
+  c=calc(b['price'],ref,fee_rate,shipping)
+  if c['profit']>=min_profit and c['margin']>=min_margin:
+   out.append({'name':b['name'],'purchase_price':round(b['price']),'sale_price':round(ref),'fee':c['fee'],'shipping':round(shipping),'profit':c['profit'],'margin':c['margin'],'purchase_source':b['source'],'purchase_url':b['url'],'sale_source':sale['source'],'sale_url':sale['url'],'image':b.get('image') or sale.get('image') or '','note':'売価は検索結果から算出した参考値。同一JAN・型番・状態を確認してください。'})
+ return sorted(out,key=lambda x:x['profit'],reverse=True)[:50]
 
-HTML = '<!doctype html>\n<html lang="ja">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">\n<meta name="theme-color" content="#111">\n<title>せどりリサーチBot</title>\n<style>\n*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#111;font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif}\n.app{max-width:520px;margin:auto;padding:calc(16px + env(safe-area-inset-top)) 14px 25px}\nh1{font-size:25px;margin:0;font-weight:800}.sub{color:#777;font-size:13px;margin:5px 0 15px}\n.card,.item{background:#fff;border:1px solid #e5e5e8;border-radius:18px;padding:15px;margin-bottom:12px}\nlabel{display:block;font-size:12px;font-weight:700;color:#666;margin:0 0 6px}\ninput{width:100%;height:49px;border:1px solid #ddd;border-radius:12px;padding:0 13px;font-size:16px;background:#fff}\n.row{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}\nbutton{width:100%;height:55px;border:0;border-radius:14px;background:#111;color:#fff;font-size:16px;font-weight:800;margin-top:12px}\nbutton:disabled{opacity:.55}.status{font-size:12px;color:#777;margin:10px 2px}\n.item .top{font-size:12px;color:#777}.name{font-size:17px;font-weight:800;line-height:1.35;margin:8px 0 12px}\n.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.metric{background:#f7f7f8;border-radius:12px;padding:10px}\n.metric small{display:block;color:#777;font-size:11px}.metric b{font-size:17px}\n.dark{background:#111;color:#fff}.dark small{color:#bbb}\n.advice{margin-top:10px;padding:11px;background:#f7f7f8;border-radius:12px;font-size:13px;line-height:1.5}\na{display:flex;align-items:center;justify-content:center;text-decoration:none;background:#111;color:#fff;border-radius:12px;height:46px;margin-top:10px;font-size:13px;font-weight:800}\n.empty{text-align:center;color:#777;padding:25px 5px}\n</style>\n</head>\n<body>\n<main class="app">\n<h1>せどりリサーチBot</h1>\n<div class="sub">iPhoneで利益商品をすばやくチェック</div>\n<section class="card">\n<label>キーワード</label>\n<input id="q" placeholder="例：ゲーム、イヤホン、フィギュア" inputmode="search">\n<div class="row">\n<div><label>最低利益</label><input id="p" type="number" value="2000" inputmode="numeric"></div>\n<div><label>最低利益率</label><input id="m" type="number" value="20" inputmode="decimal"></div>\n</div>\n<button id="btn">🔎 利益商品を探す</button>\n</section>\n<div class="status" id="s">条件を設定して検索してください</div>\n<section id="r"></section>\n</main>\n<script>\nconst yen=n=>n==null?"—":"¥"+Number(n).toLocaleString();\nconst esc=s=>String(s).replace(/[&<>"\']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[c]));\nconst b=document.getElementById("btn"),r=document.getElementById("r"),s=document.getElementById("s");\nasync function go(){\n b.disabled=true;b.textContent="検索中…";r.innerHTML="";s.textContent="商品をチェックしています";\n try{\n  const q=encodeURIComponent(document.getElementById("q").value);\n  const p=document.getElementById("p").value||0,m=document.getElementById("m").value||0;\n  const res=await fetch(`/api/search?keyword=${q}&min_profit=${p}&min_margin=${m}`);\n  const d=await res.json();\n  s.textContent=`候補 ${d.items.length}件`;\n  if(!d.items.length){r.innerHTML=\'<div class="card empty">条件に合う商品がありません。<br>利益条件を少し下げてみてください。</div>\';return}\n  r.innerHTML=d.items.map((x,i)=>`<article class="item">\n   <div class="top">#${i+1}\u3000${esc(x.source)}</div>\n   <div class="name">${esc(x.name)}</div>\n   <div class="grid">\n    <div class="metric"><small>仕入れ価格</small><b>${yen(x.buy)}</b></div>\n    <div class="metric"><small>販売価格</small><b>${yen(x.sell)}</b></div>\n    <div class="metric dark"><small>想定利益</small><b>${yen(x.profit)}</b></div>\n    <div class="metric"><small>利益率</small><b>${x.margin}%</b></div>\n   </div>\n   <div class="advice">💡 <b>販売アドバイス</b><br>${x.profit>=3000?"利益額が大きめ。相場と売れ行きを確認して出品候補に。":"回転率と相場を確認して出品価格を決めるのがおすすめ。"}</div>\n   <a href="${esc(x.url)}" target="_blank" rel="noopener">仕入れページを開く ↗</a>\n  </article>`).join("");\n }catch(e){s.textContent="エラー";r.innerHTML=\'<div class="card empty">サーバーが起動していない可能性があります。</div>\'}\n finally{b.disabled=false;b.textContent="🔎 利益商品を探す"}\n}\nb.onclick=go;document.getElementById("q").onkeydown=e=>{if(e.key==="Enter")go()};\n</script>\n</body>\n</html>'
+@app.get('/',response_class=HTMLResponse)
+async def home(): return HTML
 
+@app.get('/api/search')
+async def search(keyword:str=Query(...,min_length=1,max_length=80),min_profit:float=2000,min_margin:float=20,fee_rate:float=10,shipping:float=750):
+ if not (RAKUTEN_APP_ID and YAHOO_APP_ID):
+  items=[]
+  for x in DEMO:
+   c=calc(x['purchase_price'],x['sale_price'],fee_rate,shipping)
+   if c['profit']>=min_profit and c['margin']>=min_margin:
+    items.append({'name':x['name'],'purchase_price':x['purchase_price'],'sale_price':x['sale_price'],'fee':c['fee'],'shipping':shipping,'profit':c['profit'],'margin':c['margin'],'purchase_source':x['source'],'purchase_url':'https://www.rakuten.co.jp/','sale_source':x['source'],'sale_url':'https://www.rakuten.co.jp/','image':'','note':'現在はデモモード。APIキーを設定すると楽天/Yahooの検索結果を使います。'})
+  return {'mode':'demo','count':len(items),'items':items}
+ try:
+  buys,sells=await asyncio.gather(rakuten(keyword),yahoo(keyword))
+  items=candidates(buys,sells,min_profit,min_margin,fee_rate,shipping)
+  return {'mode':'live','count':len(items),'items':items,'sources':{'purchase':'楽天市場API','sale_reference':'Yahoo!ショッピングAPI'}}
+ except httpx.HTTPError as e:
+  return {'mode':'error','count':0,'items':[],'error':f'API通信エラー: {type(e).__name__}'}
+
+HTML=r'''<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111"><title>せどりリサーチBot</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#111;font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif}.wrap{max-width:760px;margin:auto;padding:22px 16px calc(40px + env(safe-area-inset-bottom))}h1{font-size:31px;margin:0 0 4px;font-weight:800}.sub{color:#777;margin:0 0 18px}.panel,.card{background:#fff;border:1px solid #ddd;border-radius:22px;padding:16px;box-shadow:0 3px 15px rgba(0,0,0,.05)}label{display:block;font-weight:700;font-size:14px;margin:2px 0 7px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}input{width:100%;font-size:18px;padding:16px;border:1px solid #d6d6d6;border-radius:15px;background:#fff}button{width:100%;border:0;border-radius:16px;background:#111;color:#fff;font-size:18px;font-weight:800;padding:17px;margin-top:14px}.status{color:#777;margin:18px 4px}.card{border-radius:19px;margin:12px 0}.card h3{font-size:17px;line-height:1.4;margin:0 0 12px}.numbers{display:grid;grid-template-columns:1fr 1fr;gap:8px}.num{background:#f7f7f8;border-radius:13px;padding:10px}.num small{display:block;color:#777;font-size:12px}.num b{font-size:18px}.profit{font-size:25px;font-weight:900;margin:12px 0 2px}.green{color:#087f3f}.muted{font-size:12px;color:#777;line-height:1.5}.links{display:flex;gap:8px;margin-top:12px}.links a{flex:1;text-align:center;text-decoration:none;background:#111;color:#fff;padding:11px;border-radius:12px;font-weight:700;font-size:13px}.badge{display:inline-block;background:#eee;padding:5px 8px;border-radius:999px;font-size:11px;margin-bottom:8px}@media(max-width:430px){h1{font-size:28px}.grid{gap:9px}}</style></head><body><div class="wrap"><h1>せどりリサーチBot</h1><p class="sub">iPhoneで利益商品をすばやくチェック</p><div class="panel"><label>キーワード</label><input id="keyword" placeholder="例：ゲーム、イヤホン、フィギュア"><div class="grid" style="margin-top:12px"><div><label>最低利益</label><input id="min_profit" type="number" value="2000"></div><div><label>最低利益率</label><input id="min_margin" type="number" value="20"></div></div><div class="grid" style="margin-top:12px"><div><label>販売手数料(%)</label><input id="fee_rate" type="number" value="10"></div><div><label>送料(円)</label><input id="shipping" type="number" value="750"></div></div><button onclick="searchProducts()">🔎 利益商品を探す</button></div><div id="status" class="status">条件を設定して検索してください</div><div id="results"></div></div><script>async function searchProducts(){const kw=document.getElementById('keyword').value.trim();if(!kw){alert('キーワードを入力してください');return}const s=document.getElementById('status'),r=document.getElementById('results');s.textContent='検索中…';r.innerHTML='';const q=new URLSearchParams({keyword:kw,min_profit:document.getElementById('min_profit').value,min_margin:document.getElementById('min_margin').value,fee_rate:document.getElementById('fee_rate').value,shipping:document.getElementById('shipping').value});try{const res=await fetch('/api/search?'+q);const d=await res.json();if(d.mode==='error'){s.textContent=d.error;return}s.textContent=`${d.count}件見つかりました（${d.mode==='live'?'実データ':'デモ'}）`;if(!d.items.length){r.innerHTML='<div class="card">条件に合う商品がありませんでした。</div>';return}r.innerHTML=d.items.map(x=>`<div class="card"><span class="badge">${esc(x.purchase_source)} → ${esc(x.sale_source)}</span><h3>${esc(x.name)}</h3><div class="numbers"><div class="num"><small>仕入れ価格</small><b>¥${num(x.purchase_price)}</b></div><div class="num"><small>参考売価</small><b>¥${num(x.sale_price)}</b></div><div class="num"><small>手数料</small><b>¥${num(x.fee)}</b></div><div class="num"><small>送料</small><b>¥${num(x.shipping)}</b></div></div><div class="profit green">利益 ¥${num(x.profit)}</div><div class="muted">利益率 ${x.margin}%</div><div class="links"><a href="${x.purchase_url}" target="_blank" rel="noopener">仕入れ先</a><a href="${x.sale_url}" target="_blank" rel="noopener">売価確認</a></div><p class="muted">${esc(x.note||'')}</p></div>`).join('')}catch(e){s.textContent='検索に失敗しました。時間を置いて再試行してください。'}}function num(v){return Number(v||0).toLocaleString('ja-JP')}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}</script></body></html>'''
